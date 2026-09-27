@@ -94,6 +94,80 @@ where:
 
 This places the RFM variables on a comparable scale before clustering.
 
+## 🪟 SQL RFM (Window Functions)
+
+The RFM aggregation can be computed **in SQL using window functions** instead of the in-memory pandas `groupby` pass. This lives in
+[`customer_segmentation_streamlit/rfm_pipeline.py`](customer_segmentation_streamlit/rfm_pipeline.py) and runs against the project's **SQLite** database — the cleaned `transactions` table already lives there and the app already uses `sqlite3`, so no new dependency is needed (SQLite ≥ 3.25 supports the window functions used here, including `NTILE`).
+
+The pandas aggregation:
+
+```python
+reference_date = df_sales["InvoiceDate"].max() + pd.Timedelta(days=1)
+rfm = df_sales.groupby("Customer ID").agg(
+    Recency  =("InvoiceDate", lambda x: (reference_date - x.max()).days),
+    Frequency=("Invoice", "nunique"),
+    Monetary =("Revenue", "sum"),
+).reset_index()
+```
+
+maps to this SQL:
+
+```sql
+WITH invoices AS (
+    -- Roll transaction LINES up to the INVOICE grain first, because
+    -- Frequency = COUNT(DISTINCT Invoice) and SQL does not allow
+    -- COUNT(DISTINCT ...) as a window function. After this dedup,
+    -- all three R/F/M aggregates are plain window functions.
+    SELECT
+        "Customer ID"    AS customer_id,
+        Invoice,
+        MAX(InvoiceDate) AS invoice_date,
+        SUM(Revenue)     AS invoice_revenue
+    FROM transactions
+    GROUP BY "Customer ID", Invoice
+),
+customer_rfm AS (
+    -- One row per customer via window aggregates PARTITIONed by customer.
+    SELECT DISTINCT
+        customer_id,
+        -- Recency: whole days from the customer's latest invoice to the
+        -- global reference date (latest invoice overall + 1 day).
+        CAST(
+            (MAX(julianday(invoice_date)) OVER () + 1.0)
+            - MAX(julianday(invoice_date)) OVER (PARTITION BY customer_id)
+            AS INTEGER
+        )                                                    AS Recency,
+        COUNT(*)             OVER (PARTITION BY customer_id) AS Frequency,
+        SUM(invoice_revenue) OVER (PARTITION BY customer_id) AS Monetary
+    FROM invoices
+)
+SELECT
+    customer_id AS "Customer ID",
+    Recency, Frequency, Monetary,
+    -- Classic RFM 1–5 scores via NTILE. Recency is reverse-scored so the
+    -- most-recent customers get the best bucket (5).
+    NTILE(5) OVER (ORDER BY Recency DESC)  AS R_Score,
+    NTILE(5) OVER (ORDER BY Frequency ASC) AS F_Score,
+    NTILE(5) OVER (ORDER BY Monetary ASC)  AS M_Score
+FROM customer_rfm
+ORDER BY customer_id;
+```
+
+Notes worth knowing:
+
+* **`MAX(...) OVER ()`** (empty window) spans the whole table, giving the global reference date on every row.
+* **`CAST(... AS INTEGER)`** truncates the fractional day to match pandas `Timedelta(...).days`.
+* The **`NTILE` R/F/M scores are an additional feature.** The dashboard's segments still come from the K-Means step; because the SQL produces byte-for-byte identical R/F/M values, the resulting segments are unchanged.
+
+A parity test asserts this equivalence:
+
+```bash
+cd customer_segmentation_streamlit
+pytest test_rfm_sql.py -v
+```
+
+It checks that the SQL R/F/M equals the pandas R/F/M for every customer, and that the full pipeline yields identical segment counts on both paths. To rebuild the `customers` table from the SQL path: `python rfm_pipeline.py`.
+
 ## 🤖 Customer Segmentation
 
 The processed RFM features are used to identify groups of customers with similar purchasing behavior.
